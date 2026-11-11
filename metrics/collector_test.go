@@ -1,0 +1,443 @@
+package metrics
+
+import (
+	"archive/tar"
+	"bytes"
+	"context"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"strconv"
+	"strings"
+	"testing"
+
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
+	"github.com/prometheus/common/model"
+
+	"github.com/cybozu-go/sabakan/v3"
+	"github.com/cybozu-go/sabakan/v3/models/mock"
+)
+
+type expectedMachineStatus struct {
+	status string
+	labels map[string]string
+}
+
+type machineStatusTestCase struct {
+	name            string
+	input           func() (*sabakan.Model, error)
+	expectedMetrics []expectedMachineStatus
+}
+
+type apiTestCase struct {
+	name           string
+	statusCode     int
+	path           string
+	verb           string
+	expectedLabels map[string]string
+}
+
+type assetsTestCase struct {
+	name          string
+	input         func() (*sabakan.Model, error)
+	expectedName  string
+	expectedValue float64
+}
+
+func testMachineStatus(t *testing.T) {
+	testCases := []machineStatusTestCase{
+		{
+			name:  "1 uninitialized, 1 healthy",
+			input: twoMachines,
+			expectedMetrics: []expectedMachineStatus{
+				{
+					status: sabakan.StateUninitialized.String(),
+					labels: map[string]string{
+						"address":      "10.0.0.1",
+						"serial":       "001",
+						"rack":         "1",
+						"role":         "cs",
+						"machine_type": "cray-1",
+					},
+				},
+				{
+					status: sabakan.StateHealthy.String(),
+					labels: map[string]string{
+						"address":      "10.0.0.2",
+						"serial":       "002",
+						"rack":         "2",
+						"role":         "ss",
+						"machine_type": "cray-2",
+					},
+				},
+			},
+		},
+	}
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			model, err := tt.input()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			collector := NewCollector(model)
+			handler := GetHandler(collector)
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/metrics", nil)
+			handler.ServeHTTP(w, req)
+			metricsFamily, err := parseMetrics(w.Result())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			found := false
+			for _, mf := range metricsFamily {
+				if *mf.Name != "sabakan_machine_status" {
+					continue
+				}
+				found = true
+				for _, em := range tt.expectedMetrics {
+					states := make(map[string]bool)
+					for _, m := range mf.Metric {
+						lm := labelToMap(m.Label)
+						if !hasLabels(lm, em.labels) {
+							continue
+						}
+						states[lm["status"]] = true
+						if lm["status"] == em.status && *m.Gauge.Value != 1 {
+							t.Errorf("expected status %q of %q must be 1 but %f", lm["status"], em.labels["serial"], *m.Gauge.Value)
+						}
+						if lm["status"] != em.status && *m.Gauge.Value != 0 {
+							t.Errorf("unexpected status %q of %q must be 0 but %f", lm["status"], em.labels["serial"], *m.Gauge.Value)
+						}
+					}
+					for _, s := range sabakan.StateList {
+						if !states[s.String()] {
+							t.Errorf("metrics for %q was not found", em.labels["serial"])
+						}
+					}
+				}
+			}
+			if !found {
+				t.Error("metrics sabakan_machine_status was not found")
+			}
+		})
+	}
+}
+
+func MachineStatusWhenMachineDeleted(t *testing.T) {
+	model, err := twoMachines()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectedLabels := map[string]string{
+		"serial": "002",
+	}
+
+	collector := NewCollector(model)
+	handler := GetHandler(collector)
+	// If machines are deleted, corresponding metrics is also deleted
+	err = model.Machine.SetState(context.Background(), "001", sabakan.StateRetiring)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = model.Machine.SetState(context.Background(), "001", sabakan.StateRetired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = model.Machine.Delete(context.Background(), "001")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	handler.ServeHTTP(w, req)
+	metricsFamily, err := parseMetrics(w.Result())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	found := false
+	for _, mf := range metricsFamily {
+		if *mf.Name != "sabakan_machine_status" {
+			continue
+		}
+		for _, m := range mf.Metric {
+			lm := labelToMap(m.Label)
+			if !hasLabels(lm, expectedLabels) {
+				t.Errorf("expected labels must be %q but %q", expectedLabels, lm)
+			}
+		}
+	}
+	if found {
+		t.Error("metrics sabakan_machine_status was not deleted")
+	}
+}
+
+func testAPIMetrics(t *testing.T) {
+	testCases := []apiTestCase{
+		{
+			name:       "get version",
+			statusCode: 200,
+			path:       "/version",
+			verb:       "GET",
+			expectedLabels: map[string]string{
+				"code": "200",
+				"path": "/version",
+				"verb": "GET",
+			},
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			counter := NewCounter()
+			model := mock.NewModel()
+			collector := NewCollector(&model)
+			handler := GetHandler(collector)
+
+			oldValue, err := getCounterValue(handler, "sabakan_api_request_count", tt.expectedLabels)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			counter.Inc(tt.statusCode, tt.path, tt.verb)
+
+			newValue, err := getCounterValue(handler, "sabakan_api_request_count", tt.expectedLabels)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			if (newValue - oldValue) != 1 {
+				t.Errorf("counter value difference must be 1 but %f", newValue-oldValue)
+			}
+		})
+	}
+}
+
+func testAssetsMetrics(t *testing.T) {
+	testCases := []assetsTestCase{
+		{
+			name:          "get total size of assets",
+			input:         twoAssets,
+			expectedName:  "sabakan_assets_bytes_total",
+			expectedValue: 6,
+		},
+		{
+			name:          "get total item numbers of assets",
+			input:         twoAssets,
+			expectedName:  "sabakan_assets_items_total",
+			expectedValue: 2,
+		},
+		{
+			name:          "get total size of images",
+			input:         threeImages,
+			expectedName:  "sabakan_images_bytes_total",
+			expectedValue: 36,
+		},
+		{
+			name:          "get total item numbers of images",
+			input:         threeImages,
+			expectedName:  "sabakan_images_items_total",
+			expectedValue: 3,
+		},
+	}
+
+	for _, tt := range testCases {
+		t.Run(tt.name, func(t *testing.T) {
+			model, err := tt.input()
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			collector := NewCollector(model)
+			handler := GetHandler(collector)
+
+			w := httptest.NewRecorder()
+			req := httptest.NewRequest("GET", "/metrics", nil)
+			handler.ServeHTTP(w, req)
+			metricsFamily, err := parseMetrics(w.Result())
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			found := false
+			for _, mf := range metricsFamily {
+				if *mf.Name != tt.expectedName {
+					continue
+				}
+				found = true
+				for _, m := range mf.Metric {
+					if *m.Gauge.Value != tt.expectedValue {
+						t.Errorf("value for %q is wrong.  expected: %f, actual: %f", tt.expectedName, tt.expectedValue, *m.Gauge.Value)
+					}
+				}
+			}
+			if !found {
+				t.Errorf("metrics %q was not found", tt.expectedName)
+			}
+		})
+	}
+}
+
+func twoMachines() (*sabakan.Model, error) {
+	model := mock.NewModel()
+	machines := []*sabakan.Machine{
+		{
+			Spec: sabakan.MachineSpec{
+				Serial: "001",
+				Rack:   1,
+				Role:   "cs",
+				Labels: map[string]string{"machine-type": "cray-1"},
+				IPv4:   []string{"10.0.0.1"},
+			},
+			Status: sabakan.MachineStatus{
+				State: sabakan.StateUninitialized,
+			},
+		},
+		{
+			Spec: sabakan.MachineSpec{
+				Serial: "002",
+				Rack:   2,
+				Role:   "ss",
+				Labels: map[string]string{"machine-type": "cray-2"},
+				IPv4:   []string{"10.0.0.2"},
+			},
+			Status: sabakan.MachineStatus{
+				State: sabakan.StateHealthy,
+			},
+		},
+	}
+	err := model.Machine.Register(context.Background(), machines)
+	return &model, err
+}
+
+func twoAssets() (*sabakan.Model, error) {
+	model := mock.NewModel()
+
+	for i := range 2 {
+		_, err := model.Asset.Put(context.Background(), "asset"+strconv.Itoa(i), "ctype"+strconv.Itoa(i), nil, nil, strings.NewReader("bar"))
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &model, nil
+}
+
+func threeImages() (*sabakan.Model, error) {
+	model := mock.NewModel()
+
+	for i := range 3 {
+		r, err := newTestImage("kernel", "initrd")
+		if err != nil {
+			return nil, err
+		}
+		err = model.Image.Upload(context.Background(), "coreos", "image"+strconv.Itoa(i), r)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return &model, nil
+}
+
+func newTestImage(kernel, initrd string) (io.Reader, error) {
+	buf := new(bytes.Buffer)
+	tw := tar.NewWriter(buf)
+	hdr := &tar.Header{
+		Name: sabakan.ImageKernelFilename,
+		Mode: 0o644,
+		Size: int64(len(kernel)),
+	}
+	err := tw.WriteHeader(hdr)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = tw.Write([]byte(kernel))
+
+	hdr = &tar.Header{
+		Name: sabakan.ImageInitrdFilename,
+		Mode: 0o644,
+		Size: int64(len(initrd)),
+	}
+	err = tw.WriteHeader(hdr)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = tw.Write([]byte(initrd))
+	tw.Close()
+	return buf, nil
+}
+
+func labelToMap(labelPair []*dto.LabelPair) map[string]string {
+	res := make(map[string]string)
+	for _, l := range labelPair {
+		res[*l.Name] = *l.Value
+	}
+	return res
+}
+
+func hasLabels(lm map[string]string, expectedLabels map[string]string) bool {
+	for ek, ev := range expectedLabels {
+		found := false
+		for k, v := range lm {
+			if k == ek && v == ev {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func parseMetrics(resp *http.Response) ([]*dto.MetricFamily, error) {
+	parser := expfmt.NewTextParser(model.UTF8Validation)
+	parsed, err := parser.TextToMetricFamilies(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var result []*dto.MetricFamily
+	for _, mf := range parsed {
+		result = append(result, mf)
+	}
+	return result, nil
+}
+
+func getCounterValue(handler http.Handler, name string, labels map[string]string) (float64, error) {
+	w := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/metrics", nil)
+	handler.ServeHTTP(w, req)
+	metricsFamily, err := parseMetrics(w.Result())
+	if err != nil {
+		return 0, err
+	}
+
+	for _, mf := range metricsFamily {
+		if *mf.Name != name {
+			continue
+		}
+		for _, m := range mf.Metric {
+			lm := labelToMap(m.Label)
+			if hasLabels(lm, labels) {
+				return *m.Counter.Value, nil
+			}
+		}
+	}
+
+	// not found
+	return 0, nil
+}
+
+func TestMetrics(t *testing.T) {
+	t.Run("MachineStatus", testMachineStatus)
+	t.Run("MachineStatusWhenMachineDeleted", MachineStatusWhenMachineDeleted)
+	t.Run("APIMetrics", testAPIMetrics)
+	t.Run("AssetsImagesMetrics", testAssetsMetrics)
+}

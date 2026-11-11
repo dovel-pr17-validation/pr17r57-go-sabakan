@@ -1,0 +1,11 @@
+passwd: passwd.yml
+files:
+  - /etc/hostname
+  - /etc/sabakan/sabakan-tls-ca.crt
+networkd:
+  - 10-eth0.network
+systemd:
+  - name: tcsd.service
+    mask: true
+  - name: sabakan-cryptsetup.service
+    enabled: true

@@ -1,0 +1,11 @@
+version: "2.3"
+include: ../base/base.yml
+files:
+  - /etc/hostname
+systemd:
+  - name: bird.service
+    enabled: false
+  - name: update-engine.service
+    mask: true
+networkd:
+  - 10-node0.netdev

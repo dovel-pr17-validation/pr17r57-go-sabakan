@@ -1,0 +1,71 @@
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
+env:
+  tag: ${GITHUB_REF#refs/tags/v}
+  prerelease: ${{ contains(github.ref, '-') }}
+jobs:
+  release-image:
+    name: Release Sabakan Image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+
+      - name: Build image
+        run: make docker-build
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Push container image
+        run: |
+          echo "pushing Sabakan image ..."
+          docker tag ghcr.io/cybozu-go/sabakan:latest ghcr.io/cybozu-go/sabakan:${{ env.tag }}
+          docker push ghcr.io/cybozu-go/sabakan:${{ env.tag }}
+          if ${{ env.prerelease }} ; then
+              echo ===== Skip pushing branch tags for pre-release ${{ env.tag }} =====
+              exit 0
+          fi
+          BRANCH=$(echo ${{ env.tag }} | cut -d "." -f 1-2)
+          docker tag ghcr.io/cybozu-go/sabakan:latest ghcr.io/cybozu-go/sabakan:$BRANCH
+          docker push ghcr.io/cybozu-go/sabakan:$BRANCH
+
+  release-github:
+    name: Release GitHub
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION=v${{ env.tag }}
+          if ${{ env.prerelease }}; then PRERELEASE_FLAG=-p; fi
+          gh release create $VERSION $PRERELEASE_FLAG \
+            -t "Release $VERSION"  \
+            -n "See [CHANGELOG.md](./CHANGELOG.md) for details."

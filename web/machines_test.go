@@ -1,0 +1,618 @@
+package web
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"net"
+	"net/http"
+	"net/http/httptest"
+	"net/url"
+	"path"
+	"reflect"
+	"strings"
+	"testing"
+
+	"github.com/vektah/gqlparser/v2/gqlerror"
+
+	"github.com/cybozu-go/sabakan/v3"
+	"github.com/cybozu-go/sabakan/v3/models/mock"
+)
+
+type setStateResponse struct {
+	Errors []gqlerror.Error `json:"errors"`
+	Data   struct {
+		State []any `json:"state"`
+	} `json:"data"`
+}
+
+func testMachinesPost(t *testing.T) {
+	m := mock.NewModel()
+	handler := newTestServer(m)
+
+	cases := []struct {
+		machine  string
+		expected int
+	}{
+		{`[{
+  "serial": "1234abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusCreated},
+		{`[{
+  "serial": "1234abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusConflict},
+		{`[{
+  "serial": "1234abcd",
+  "labels": {
+	  "product": "R630"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusConflict},
+		{`[{
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "5678abcd",
+  "labels": {
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusCreated},
+		{`[{
+  "serial": "0000abcd",
+  "labels": {
+  	  "product": "R630"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusCreated},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot"
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "&invalid$ bmc#type+"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "product": "R630",
+	  "datacenter": "ty3"
+  },
+  "rack": 1,
+  "role": "invalid/Role",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "invalidKey~+ = ';": "invalidkey"
+  },
+  "rack": 1,
+  "role": "invalid/Role",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "2222abcd",
+  "labels": {
+	  "invalid_value": "invalid\n\tvalue"
+  },
+  "rack": 1,
+  "role": "invalid/Role",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusBadRequest},
+		{`[{
+  "serial": "3333abcd",
+  "labels": {},
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusCreated},
+		{`[{
+  "serial": "3333efgh",
+  "rack": 1,
+  "role": "boot",
+  "bmc": {"type": "iDRAC-9"}
+}]`, http.StatusCreated},
+	}
+
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		r := httptest.NewRequest("POST", "/api/v1/machines", strings.NewReader(c.machine))
+		handler.ServeHTTP(w, r)
+
+		resp := w.Result()
+		if resp.StatusCode != c.expected {
+			t.Error("wrong status code:", resp.StatusCode)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusCreated {
+			continue
+		}
+
+		_, err := m.Machine.Get(context.Background(), "1234abcd")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func testMachinesGet(t *testing.T) {
+	m := mock.NewModel()
+	handler := Server{Model: m}
+
+	_ = m.Machine.Register(context.Background(), []*sabakan.Machine{
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "1234abcd",
+			Labels: map[string]string{
+				"product":    "R630",
+				"datacenter": "ty3",
+			},
+			Rack: 1,
+			Role: "boot",
+			BMC:  sabakan.MachineBMC{Type: "iDRAC-9"},
+		}),
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "5678abcd",
+			Labels: map[string]string{
+				"product":    "R740",
+				"datacenter": "ty3",
+			},
+			Rack: 1,
+			Role: "worker",
+			BMC:  sabakan.MachineBMC{Type: "iDRAC-9"},
+		}),
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "1234efgh",
+			Labels: map[string]string{
+				"product":    "R630",
+				"datacenter": "ty3",
+			},
+			Rack: 2,
+			Role: "boot",
+			BMC:  sabakan.MachineBMC{Type: "IPMI-2.0"},
+		}),
+	})
+
+	cases := []struct {
+		query    url.Values
+		status   int
+		expected map[string]bool
+	}{
+		{
+			query:    map[string][]string{"serial": {"1234abcd"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true},
+		},
+		{
+			query:    map[string][]string{"serial": {"1234abcd,5678abcd"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true},
+		},
+		{
+			query:    map[string][]string{"labels": {"product=R630"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"labels": {"datacenter=ty3"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"rack": {"1"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true},
+		},
+		{
+			query:    map[string][]string{"rack": {"1,2"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"role": {"boot"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"role": {"boot,worker"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"bmc-type": {"iDRAC-9"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true},
+		},
+		{
+			query:    map[string][]string{"bmc-type": {"iDRAC-9,IPMI-2.0"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"state": {"uninitialized"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234abcd": true, "5678abcd": true, "1234efgh": true},
+		},
+
+		{
+			query:    map[string][]string{"serial": {"5689abcd"}},
+			status:   http.StatusNotFound,
+			expected: nil,
+		},
+		{
+			query:    map[string][]string{"state": {"unreachable"}},
+			status:   http.StatusNotFound,
+			expected: nil,
+		},
+		{
+			query:    map[string][]string{"without-serial": {"1234abcd"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"5678abcd": true, "1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"without-labels": {"product=R630"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"5678abcd": true},
+		},
+		{
+			query:    map[string][]string{"without-rack": {"1"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"without-role": {"boot"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"5678abcd": true},
+		},
+		{
+			query:    map[string][]string{"without-bmc-type": {"iDRAC-9"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"1234efgh": true},
+		},
+		{
+			query:    map[string][]string{"without-state": {"uninitialized"}},
+			status:   http.StatusNotFound,
+			expected: nil,
+		},
+		{
+			query:    map[string][]string{"without-state": {"uninitialized"}, "state": {"uninitialized"}},
+			status:   http.StatusBadRequest,
+			expected: nil,
+		},
+		{
+			query:    map[string][]string{"without-serial": {"1234abcd"}, "bmc-type": {"iDRAC-9"}},
+			status:   http.StatusOK,
+			expected: map[string]bool{"5678abcd": true},
+		},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		u := url.URL{Path: "/api/v1/machines", RawQuery: c.query.Encode()}
+		r := httptest.NewRequest("GET", u.String(), nil)
+
+		handler.ServeHTTP(w, r)
+
+		resp := w.Result()
+		if resp.StatusCode != c.status {
+			t.Error("wrong status code:", resp.StatusCode)
+		}
+		if resp.StatusCode != http.StatusOK {
+			continue
+		}
+		var machines []*sabakan.Machine
+		err := json.NewDecoder(resp.Body).Decode(&machines)
+		resp.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		serials := make(map[string]bool)
+		for _, m := range machines {
+			if m.Status.Duration == 0 {
+				t.Error("duration should not be zero")
+			}
+			serials[m.Spec.Serial] = true
+		}
+		if !reflect.DeepEqual(serials, c.expected) {
+			t.Errorf("wrong query result: %#v,%#v", serials, c.query)
+		}
+	}
+}
+
+func testMachinesDelete(t *testing.T) {
+	m := mock.NewModel()
+	handler := newTestServer(m)
+
+	m1 := sabakan.NewMachine(sabakan.MachineSpec{
+		Serial: "1234abcd",
+		Labels: map[string]string{
+			"product":    "R630",
+			"datacenter": "ty3",
+		},
+		Rack: 1,
+		Role: "boot",
+	})
+	m2 := sabakan.NewMachine(sabakan.MachineSpec{
+		Serial: "qqq",
+		Labels: map[string]string{
+			"product":    "R630",
+			"datacenter": "ty3",
+		},
+		Rack: 2,
+		Role: "cs",
+	})
+	m2.Status.State = sabakan.StateRetired
+
+	err := m.Machine.Register(context.Background(), []*sabakan.Machine{m1, m2})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		serial string
+		status int
+	}{
+		{
+			serial: "1234abcd",
+			status: http.StatusInternalServerError,
+		},
+		{
+			serial: "qqq",
+			status: http.StatusOK,
+		},
+		{
+			serial: "5678efgh",
+			status: http.StatusNotFound,
+		},
+	}
+	for _, c := range cases {
+		w := httptest.NewRecorder()
+		u := path.Join("/api/v1/machines", c.serial)
+		r := httptest.NewRequest("DELETE", u, nil)
+
+		handler.ServeHTTP(w, r)
+
+		resp := w.Result()
+		if resp.StatusCode != c.status {
+			t.Error("wrong status code:", resp.StatusCode, c.serial)
+		}
+	}
+}
+
+func testMachinesGraphQL(t *testing.T) {
+	m := mock.NewModel()
+	handler := newTestServer(m)
+
+	_ = m.Machine.Register(context.Background(), []*sabakan.Machine{
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "1234abcd",
+			Labels: map[string]string{
+				"product":    "R630",
+				"datacenter": "ty3",
+			},
+			Rack: 1,
+			Role: "boot",
+			BMC:  sabakan.MachineBMC{Type: "iDRAC-9"},
+		}),
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "5678abcd",
+			Labels: map[string]string{
+				"product":    "R740",
+				"datacenter": "ty3",
+			},
+			Rack: 1,
+			Role: "worker",
+			BMC:  sabakan.MachineBMC{Type: "iDRAC-9"},
+		}),
+		sabakan.NewMachine(sabakan.MachineSpec{
+			Serial: "1234efgh",
+			Labels: map[string]string{
+				"product":    "R630",
+				"datacenter": "ty3",
+			},
+			Rack: 2,
+			Role: "boot",
+			BMC:  sabakan.MachineBMC{Type: "IPMI-2.0"},
+		}),
+	})
+
+	v := url.Values{}
+	v.Set("query", `{searchMachines { spec { serial } } }`)
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("GET", "/graphql?"+v.Encode(), nil)
+	handler.ServeHTTP(w, r)
+
+	resp := w.Result()
+	if resp.StatusCode != http.StatusOK {
+		t.Error("wrong status code:", resp.StatusCode)
+	}
+
+	var gqlResponse struct {
+		Errors []any `json:"errors"`
+		Data   struct {
+			SearchMachines []any `json:"searchMachines"`
+		} `json:"data"`
+	}
+	err := json.NewDecoder(resp.Body).Decode(&gqlResponse)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	if len(gqlResponse.Data.SearchMachines) != 3 {
+		t.Error(`len(gqlResponse.Data.SearchMachines) != 3`, gqlResponse)
+	}
+
+	// Test for mutation SetMachineState()
+	_, err = setMachineState("UNINITIALIZED", handler, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ssr, err := setMachineState("UPDATING", handler, t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eType := ssr.Errors[0].Extensions["type"]; eType != "INVALID_STATE_TRANSITION" {
+		t.Error("invalid `type` value. expected:", "INVALID_STATE_TRANSITION", "actual:", eType)
+	}
+}
+
+func setMachineState(state string, handler *Server, t *testing.T) (setStateResponse, error) {
+	var ssr setStateResponse
+	resp := setMachineStateRequest(state, handler)
+	if resp.StatusCode != http.StatusOK {
+		t.Error("wrong status code:", resp.StatusCode)
+	}
+	err := json.NewDecoder(resp.Body).Decode(&ssr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	return ssr, err
+}
+
+func setMachineStateRequest(state string, handler *Server) *http.Response {
+	requestBody := `{"query":"mutation {\n  setMachineState(serial: \"1234abcd\", state: ` + state + `) {\n    state, timestamp, duration\n  }\n}\n\n"}`
+	w := httptest.NewRecorder()
+	r := httptest.NewRequest("POST", "/graphql", strings.NewReader(requestBody))
+	r.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(w, r)
+	return w.Result()
+}
+
+func testMachinesGraphQLPermission(t *testing.T) {
+	cases := []struct {
+		name      string
+		remote    string
+		query     string
+		wantState sabakan.MachineState
+		wantError string
+	}{
+		{
+			name:      "query from a remote that is not allowed",
+			remote:    "10.69.0.4:11111",
+			query:     `query { machine(serial: "1234abcd") { status { state } } }`,
+			wantState: sabakan.StateUninitialized,
+		},
+		{
+			name:      "mutation from a remote that is not allowed",
+			remote:    "10.69.0.4:11111",
+			query:     `mutation { setMachineState(serial: "1234abcd", state: RETIRING) { state } }`,
+			wantState: sabakan.StateUninitialized,
+			wantError: "FORBIDDEN",
+		},
+		{
+			name:      "mutation from an allowed remote",
+			remote:    "127.0.0.1:11111",
+			query:     `mutation { setMachineState(serial: "1234abcd", state: RETIRING) { state } }`,
+			wantState: sabakan.StateRetiring,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			m := mock.NewModel()
+			err := m.Machine.Register(context.Background(), []*sabakan.Machine{
+				sabakan.NewMachine(sabakan.MachineSpec{Serial: "1234abcd", Role: "worker"}),
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, ipnet, err := net.ParseCIDR("127.0.0.1/32")
+			if err != nil {
+				t.Fatal(err)
+			}
+			handler := NewServer(m, "", "", nil, nil, []*net.IPNet{ipnet}, false, nil, false)
+
+			body, err := json.Marshal(map[string]string{"query": tc.query})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := httptest.NewRecorder()
+			r := httptest.NewRequest("POST", "/graphql", bytes.NewReader(body))
+			r.RemoteAddr = tc.remote
+			r.Header.Set("Content-Type", "application/json")
+			handler.ServeHTTP(w, r)
+
+			var resp struct {
+				Errors []gqlerror.Error `json:"errors"`
+			}
+			if err := json.NewDecoder(w.Result().Body).Decode(&resp); err != nil {
+				t.Fatal(err)
+			}
+			switch {
+			case tc.wantError == "" && len(resp.Errors) != 0:
+				t.Errorf("unexpected errors: %v", resp.Errors)
+			case tc.wantError != "" && len(resp.Errors) == 0:
+				t.Errorf("no errors, want type %q", tc.wantError)
+			case tc.wantError != "":
+				if got, _ := resp.Errors[0].Extensions["type"].(string); got != tc.wantError {
+					t.Errorf("error type = %q, want %q (errors=%v)", got, tc.wantError, resp.Errors)
+				}
+			}
+
+			machine, err := m.Machine.Get(context.Background(), "1234abcd")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if machine.Status.State != tc.wantState {
+				t.Errorf("state = %s, want %s", machine.Status.State, tc.wantState)
+			}
+		})
+	}
+}
+
+func TestMachines(t *testing.T) {
+	t.Run("Get", testMachinesGet)
+	t.Run("Post", testMachinesPost)
+	t.Run("Delete", testMachinesDelete)
+	t.Run("GraphQL", testMachinesGraphQL)
+	t.Run("GraphQLPermission", testMachinesGraphQLPermission)
+}

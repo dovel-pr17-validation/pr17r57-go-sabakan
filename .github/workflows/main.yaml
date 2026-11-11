@@ -1,0 +1,213 @@
+name: main
+on:
+  pull_request:
+  push:
+    branches:
+      - 'main'
+env:
+  filename: 'main.yaml'
+permissions:
+  contents: read
+jobs:
+  static-check:
+    name: Static Check
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+
+      - name: Install test tools
+        run: make SUDO="sudo" test-tools
+
+      - name: Check auto-generated files
+        run: make check-generated
+
+      - name: Check code format
+        run: |
+          make fmt
+          git diff --exit-code
+
+      - name: Run code check tools
+        run: make lint
+
+  unit-test:
+    name: Unit Test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+
+      - name: Install test tools
+        run: make SUDO="sudo" test-tools
+
+      - name: Build binaries
+        run: make build
+
+      - name: Run test
+        run: make test
+
+  e2e-test:
+    name: e2e Test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+
+      - name: Install test tools
+        run: make SUDO="sudo" test-tools
+
+      - name: Setup cfssl
+        run: make SUDO="sudo" setup-cfssl
+
+      - name: Build binaries
+        run: make build
+
+      - name: Run test
+        run: make e2e
+
+  build-image:
+    name: Build Images
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+
+      - name: Build image
+        run: make docker-build
+
+  mtest:
+    name: Multi-host test
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Setup golang
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version-file: go.mod
+
+      - name: Setup Takumi Guard
+        uses: flatt-security/setup-takumi-guard-golang@1c8aa7498f7f635fbd6ad6a0f436d03092b3502d # v1.1.0
+        with:
+          bot-id: '${{ vars.TAKUMI_GUARD_BOT_ID }}'
+          # The token is forwarded to the GCE instance and has to stay valid
+          # until the multi-host test has downloaded its modules there.
+          expires-in: '3600'
+
+      - id: auth
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3.0.0
+        with:
+          credentials_json: '${{ secrets.NECO_TEST_SERVICE_ACCOUNT }}'
+
+      - name: Set up Cloud SDK for sabakan
+        uses: google-github-actions/setup-gcloud@aa5489c8933f4cc7a4f7d45035b3b1440c9c10db # v3.0.1
+
+      - name: Set GCP instance name
+        run: echo "INSTANCE_NAME=sabakan-${{ github.run_number }}-$(TZ=Asia/Tokyo date +%H%M%S)" >> $GITHUB_ENV
+
+      - name: Watch sabakan logs
+        run: ./bin/watch_service sabakan > sabakan-service.log &
+
+      - name: Run mtest
+        run: |
+          if [ ${{ github.event_name }} = "pull_request" ]; then
+            GITHUB_SHA=$(cat ${GITHUB_EVENT_PATH} | jq -r '.pull_request.head.sha')
+          fi
+          ./bin/run-mtest.sh
+
+      - name: Show sabakan logs
+        if: ${{ always() }}
+        run: cat sabakan-service.log
+
+      - name: Set the GCP instance lifetime
+        if: ${{ failure() ||  cancelled() }}
+        run: ./bin/set-lifetime.sh
+
+      - name: Notify to Slack if failed or cancelled
+        if: ${{ failure() ||  cancelled() }}
+        run: |
+          if [[ ${{ github.event_name }} == 'pull_request' ]]; then
+              BRANCH_NAME=${GITHUB_HEAD_REF}
+          else
+              BRANCH_NAME=${GITHUB_REF#refs/heads/}
+          fi
+          curl -X POST -H 'Content-type: application/json' --data "{
+            \"blocks\": [
+              {
+                \"type\": \"section\",
+                \"text\": {
+                  \"type\": \"mrkdwn\",
+                  \"text\": \"Failed: ${{ github.actor }}'s workflow (${{ github.workflow }}) in <https://github.com/${{ github.repository }}/actions/workflows/${{ env.filename }}|${{ github.repository }}> (<https://github.com/${{ github.repository }}/actions/workflows/${{ env.filename }}?query=branch%3A${BRANCH_NAME}|${BRANCH_NAME}>) \n Do you extend the lifetime of ${INSTANCE_NAME}?\"
+                },
+                \"accessory\": {
+                  \"type\": \"button\",
+                  \"text\": {
+                    \"type\": \"plain_text\",
+                    \"text\": \"Extend\",
+                    \"emoji\": true
+                  },
+                  \"value\": \"${INSTANCE_NAME}\"
+                }
+              }
+            ]
+          }" ${{ secrets.SLACK_WEBHOOK_URL }}
+
+      - name: Delete CI instance if succeeded
+        if: ${{ success() }}
+        run: ./bin/delete-instance.sh

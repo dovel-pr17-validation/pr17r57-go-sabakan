@@ -1,0 +1,94 @@
+# placemat config file
+kind: Network
+name: ext-net
+type: external
+use-nat: true
+address: __BRIDGE_ADDRESS__/24
+---
+kind: Image
+name: coreos
+file: ../__COREOS_IMAGE__
+---
+kind: Node
+name: host1
+interfaces:
+  - ext-net
+cpu: 1
+memory: 2G
+ignition: host1.ign
+volumes:
+  - kind: image
+    name: root
+    image: coreos
+    copy-on-write: true
+  - kind: hostPath
+    name: ignitions
+    folder: ignitions
+    path: __IGNITIONS_FOLDER__
+smbios:
+  serial: "00000001"
+---
+kind: Node
+name: host2
+interfaces:
+  - ext-net
+cpu: 1
+memory: 1G
+ignition: host2.ign
+volumes:
+  - kind: image
+    name: root
+    image: coreos
+    copy-on-write: true
+  - kind: hostPath
+    name: ignitions
+    folder: ignitions
+    path: __IGNITIONS_FOLDER__
+smbios:
+  serial: "00000002"
+---
+kind: Node
+name: host3
+interfaces:
+  - ext-net
+cpu: 1
+memory: 1G
+ignition: host3.ign
+volumes:
+  - kind: image
+    name: root
+    image: coreos
+    copy-on-write: true
+  - kind: hostPath
+    name: ignitions
+    folder: ignitions
+    path: __IGNITIONS_FOLDER__
+smbios:
+  serial: "00000003"
+---
+kind: Node
+name: worker1
+interfaces:
+- ext-net
+volumes:
+- kind: raw
+  name: data
+  size: 10G
+cpu: 1
+memory: 3G
+smbios:
+  serial: "00000004"
+---
+kind: Node
+name: worker2
+interfaces:
+- ext-net
+volumes:
+- kind: raw
+  name: data
+  size: 10G
+cpu: 1
+memory: 3G
+smbios:
+  serial: "00000005"
+tpm: true

@@ -1,0 +1,4 @@
+[NetDev]
+Name=node0
+Kind=dummy
+Address={{ index .Spec.IPv4 0 }}/32
